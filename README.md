@@ -42,3 +42,4 @@ Background-
 Prerequisites to run the github actions workflows with the bonus steps added:
 1. create new github secret with the content of the self signed certificate.pem file, save it under SELF_SIGNED_CERT.
 2. create new github secret with the content of the self signed private_key.pem file, save it under SELF_SIGNED_CERT_KEY.
+3. replace subdomain.domainname.com in the ingress rules manifest with the relevant domain you own/control, make sure this domain was added in the SAN entry of the certificate.
