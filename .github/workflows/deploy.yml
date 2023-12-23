@@ -1,0 +1,91 @@
+name: GHA-GoApp
+
+on:
+  push:
+    branches: [ "main"]
+  pull_request:
+    branches: [ "main"]
+
+jobs:
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 0 }}
+
+    - name: Install doctl
+      uses: digitalocean/action-doctl@v2
+      with:
+        token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+    - name: Build container image
+      run: docker build -t ${{ secrets.REGISTRY_NAME }}/go-app:$(echo $GITHUB_SHA | head -c7) .
+
+    - name: Log in to DigitalOcean Container Registry with short-lived credentials
+      run: doctl registry login --expiry-seconds 1200
+
+    - name: Push image to DigitalOcean Container Registry
+      run: docker push ${{ secrets.REGISTRY_NAME }}/go-app:$(echo $GITHUB_SHA | head -c7)    
+    
+    - name: Update app_manifest.yml dynamic values
+      run: |
+        TAG=$(echo $GITHUB_SHA | head -c7)
+        sed -i 's|<IMAGE>|${{ secrets.REGISTRY_NAME }}/go-app:'${TAG}'|' $GITHUB_WORKSPACE/k8s/app_manifest.yml
+        sed -i 's|<DIGITALOCEAN_TOKEN>|${{ secrets.DIGITALOCEAN_ACCESS_TOKEN}}|' $GITHUB_WORKSPACE/k8s/app_manifest.yml
+
+    - name: Save DigitalOcean kubeconfig with short-lived credentials
+      run: doctl kubernetes cluster kubeconfig save --expiry-seconds 600 ${{ secrets.CLUSTER_NAME }}
+
+    - name: Check if TLS Secret exists
+      id: check_tls_secret
+      run: |
+        if kubectl get secret go-app-tls-secret &> /dev/null; then
+          echo "secret_exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "secret_exists=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Create TLS Secret if doesn't exist
+      if: steps.check_tls_secret.outputs.secret_exists != 'true'
+      run: |
+        CERT_BASE64=$(echo -n "${{ secrets.SELF_SIGNED_CERT }}" | base64)
+        PRIVATE_KEY_BASE64=$(echo -n "${{ secrets.SELF_SIGNED_CERT_KEY }}" | base64)        
+        kubectl create secret tls go-app-tls-secret --cert=<(echo "${CERT_BASE64}" | base64 -d) --key=<(echo "${PRIVATE_KEY_BASE64}" | base64 -d)
+
+    - name: Check if needs to apply ingress-nginx-controller manifest
+      id: check_ingress_nginx_controller
+      run: |
+        # check if need to deploy for the first time, by checking if there are any deployments in the ingress-nginx ns
+        echo "ingress_nginx_ctrl_check=$(kubectl get deployment ingress-nginx-controller --namespace ingress-nginx &>/dev/null || echo "false")" >> $GITHUB_OUTPUT
+        # check if need to deploy due to manifest changes
+        if ${{ github.event_name == 'pull_request' }}; then
+            changed_files=$(git diff --name-only -r HEAD^1 HEAD | xargs)
+        else
+            changed_files=$(git diff --name-only ${{ github.sha }}^..${{ github.sha }} | xargs)
+        fi
+        if [[ "$changed_files" == *"k8s/ingress-controller-manifest.yml"* ]]; then
+          echo "manifest_changes=true" >> $GITHUB_OUTPUT
+        else
+          echo "manifest_changes=false" >> $GITHUB_OUTPUT
+        fi
+        if [ "$ingress_nginx_ctrl_check" == "false" ] || [ "$manifest_changes" == "true" ]; then
+          echo "going to deploy ingress-nginx-controller manifest"
+        else
+          echo "No changes detected which require applying ingress-nginx-controller manifest, skipping next step."
+        fi
+
+    - name: Deploy ingress-nginx-controller if needed 
+      if: steps.check_ingress_nginx_controller.outputs.ingress_nginx_ctrl_check == 'false' || steps.check_ingress_nginx_controller.outputs.manifest_changes == 'true'
+      run: |
+        kubectl apply -f $GITHUB_WORKSPACE/k8s/ingress-controller-manifest.yml
+        echo "waiting 30 seconds before deploying dependent resources"
+        sleep 30 
+
+    - name: Deploy to DigitalOcean k8s cluster
+      run: kubectl apply -f $GITHUB_WORKSPACE/k8s/app_manifest.yml
+
+    - name: Verify deployment
+      run: kubectl rollout status deployment/go-app
+      
